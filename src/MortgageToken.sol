@@ -3,10 +3,14 @@ pragma solidity ^0.8.24;
 
 import {ERC721} from "openzeppelin-contracts/contracts/token/ERC721/ERC721.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice Each ERC-721 token represents one mortgage;
 /// the current tokenholder is the ERC-721 owner of that token.
 contract MortgageToken is ERC721, Ownable {
+    using SafeERC20 for IERC20;
+
     enum LifecycleStatus {
         Created,
         Disbursed,
@@ -126,6 +130,7 @@ contract MortgageToken is ERC721, Ownable {
         });
 
         _documentHashes[mortgageId] = documentHashes_;
+        
 
         _safeMint(msg.sender, mortgageId);
 
@@ -149,8 +154,41 @@ contract MortgageToken is ERC721, Ownable {
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Active);
     }
 
+    /// @notice Pulls a stablecoin interest payment from the borrower and forwards it
+    /// directly to the current tokenholder, recording the payment on-chain.
+    function payInterest(uint256 mortgageId, uint256 amount, string calldata paymentReference_) external {
+        Mortgage storage mortgage = _mortgages[mortgageId];
+        require(mortgage.mortgageId != 0, "mortgage does not exist");
+        require(mortgage.status == LifecycleStatus.Active, "mortgage not active");
+        require(msg.sender == mortgage.borrower, "only borrower can pay interest");
+        require(amount > 0, "amount must be greater than zero");
+
+        address recipient = ownerOf(mortgageId);
+
+        IERC20(mortgage.stablecoinAddress).safeTransferFrom(msg.sender, recipient, amount);
+
+        uint256 paymentIndex = _paymentRecords[mortgageId].length;
+        _paymentRecords[mortgageId].push(
+            PaymentRecord({
+                dueDate: 0,
+                amount: amount,
+                status: PaymentStatus.Paid,
+                payer: msg.sender,
+                recipient: recipient,
+                timestamp: block.timestamp,
+                paymentReference: paymentReference_
+            })
+        );
+
+        emit PaymentSettled(mortgageId, paymentIndex, msg.sender, recipient, paymentReference_);
+    }
+
     function getMortgage(uint256 mortgageId) external view returns (Mortgage memory) {
         return _mortgages[mortgageId];
+    }
+
+    function getPaymentRecords(uint256 mortgageId) external view returns (PaymentRecord[] memory) {
+        return _paymentRecords[mortgageId];
     }
 
     function getDocumentHashes(uint256 mortgageId) external view returns (bytes32[] memory) {

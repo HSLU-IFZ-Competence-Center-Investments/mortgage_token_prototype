@@ -10,6 +10,49 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_PATH = ROOT / "out" / "MortgageToken.sol" / "MortgageToken.json"
 STATE_PATH = Path(__file__).resolve().parent / ".frontend_state.json"
 
+ERC20_ABI = [
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "name": "mint",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
 st.set_page_config(page_title="Mortgage Token Demo", page_icon="\U0001F3E0", layout="centered")
 
 
@@ -21,6 +64,17 @@ def clean_hex_input(value: str) -> str:
 
 def format_status_timestamp(unix_timestamp: int) -> str:
     return datetime.fromtimestamp(unix_timestamp).strftime("%H:%M %d-%m-%Y")
+
+
+def require_success(receipt) -> None:
+    """web3 doesn't raise when a transaction reverts; wait_for_transaction_receipt
+    still returns a receipt with status 0. Surface that as an error instead of
+    silently treating it like a successful call with no matching event."""
+    if receipt.get("status") == 0:
+        raise RuntimeError(
+            f"Transaction reverted on-chain (tx {receipt['transactionHash'].hex()}). "
+            "Check that the mortgage is in the right state and the account calling it has permission."
+        )
 
 
 def load_abi() -> list:
@@ -80,7 +134,9 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Could not load contract: {e}")
 
-tab_create, tab_transfer, tab_lookup = st.tabs(["Create Mortgage", "Transfer to Investor", "Look Up Mortgage"])
+tab_create, tab_transfer, tab_pay, tab_lookup = st.tabs(
+    ["Create Mortgage", "Transfer to Investor", "Pay Interest", "Look Up Mortgage"]
+)
 
 with tab_create:
     st.subheader("Create a new mortgage token")
@@ -186,6 +242,7 @@ with tab_create:
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
                 with st.spinner("Waiting for transaction receipt..."):
                     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+                require_success(receipt)
 
                 created_events = contract.events.MortgageCreated().process_receipt(receipt)
                 if created_events:
@@ -242,6 +299,7 @@ with tab_transfer:
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
                 with st.spinner("Waiting for transaction receipt..."):
                     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+                require_success(receipt)
 
                 transferred_events = contract.events.TokenTransferredToInvestor().process_receipt(receipt)
                 if transferred_events:
@@ -249,6 +307,139 @@ with tab_transfer:
                     st.success(f"Mortgage token #{transfer_mortgage_id} transferred to investor {investor_addr}.")
                 else:
                     st.success("Transaction confirmed, but no TokenTransferredToInvestor event was found.")
+                st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
+            except Exception as e:
+                st.error(f"Transaction failed: {e}")
+
+with tab_pay:
+    st.subheader("Pay stablecoin interest")
+    st.caption(
+        "Pulls a stablecoin interest payment from the borrower's wallet and forwards it directly "
+        "to the current tokenholder, recording the payment on-chain."
+    )
+
+    if not connected:
+        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+    elif contract is None:
+        st.warning("Enter a deployed contract address in the sidebar.")
+
+    pay_mortgage_id = st.number_input("Mortgage ID", min_value=1, step=1, value=1, key="pay_mortgage_id")
+
+    stablecoin = None
+    stablecoin_decimals = 18
+    m = None
+    if contract is not None:
+        try:
+            m = contract.functions.getMortgage(pay_mortgage_id).call()
+            holder = contract.functions.currentTokenholder(pay_mortgage_id).call()
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+            st.markdown(f"**Borrower:** `{m[2]}`")
+            st.markdown(f"**Current tokenholder (recipient):** `{holder}`")
+            st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
+            st.markdown(f"**Stablecoin address:** `{m[5]}`")
+
+            stablecoin = w3.eth.contract(address=Web3.to_checksum_address(m[5]), abi=ERC20_ABI)
+            try:
+                stablecoin_decimals = stablecoin.functions.decimals().call()
+                stablecoin_symbol = stablecoin.functions.symbol().call()
+                st.markdown(f"**Stablecoin:** {stablecoin_symbol} ({stablecoin_decimals} decimals)")
+            except Exception:
+                st.info("Could not read decimals/symbol from the stablecoin contract; assuming 18 decimals.")
+        except Exception as e:
+            st.error(f"Could not load mortgage: {e}")
+
+    borrower_private_key = clean_hex_input(
+        st.text_input(
+            "Borrower private key",
+            type="password",
+            help="Only the mortgage's borrower can call payInterest; funds are pulled from this account.",
+            key="borrower_private_key",
+        )
+    )
+    with st.expander("Mint test stablecoins (MockStablecoin only)"):
+        st.caption(
+            "Only works if the stablecoin above is a MockStablecoin with an open mint() function. "
+            "Real stablecoins (e.g. testnet USDC) will reject this."
+        )
+        mint_recipient = st.text_input(
+            "Mint to address", value=m[2] if m is not None else "", key="mint_recipient"
+        )
+        mint_amount = st.number_input("Mint amount", min_value=0.0, value=10000.0, step=100.0, key="mint_amount")
+        if st.button("Mint"):
+            if not (connected and stablecoin is not None and borrower_private_key):
+                st.error("Missing node connection, stablecoin, or a private key (used to send the mint tx).")
+            else:
+                try:
+                    mint_account = w3.eth.account.from_key(borrower_private_key)
+                    mint_units = int(round(mint_amount * (10**stablecoin_decimals)))
+                    mint_tx = stablecoin.functions.mint(
+                        Web3.to_checksum_address(clean_hex_input(mint_recipient)), mint_units
+                    ).build_transaction(
+                        {
+                            "from": mint_account.address,
+                            "nonce": w3.eth.get_transaction_count(mint_account.address),
+                        }
+                    )
+                    signed_mint = w3.eth.account.sign_transaction(mint_tx, private_key=borrower_private_key)
+                    mint_hash = w3.eth.send_raw_transaction(signed_mint.raw_transaction)
+                    with st.spinner("Minting..."):
+                        mint_receipt = w3.eth.wait_for_transaction_receipt(mint_hash)
+                    require_success(mint_receipt)
+                    st.success(f"Minted {mint_amount} to {mint_recipient}.")
+                except Exception as e:
+                    st.error(f"Mint failed: {e}")
+
+    interest_amount = st.number_input("Interest amount", min_value=0.0, value=1000.0, step=10.0, key="interest_amount")
+    payment_reference = st.text_input("Payment reference", key="payment_reference")
+
+    if st.button("Pay Interest", type="primary"):
+        if not (connected and contract is not None and stablecoin is not None and borrower_private_key):
+            st.error("Missing node connection, contract address, or borrower private key.")
+        elif not payment_reference.strip():
+            st.error("Payment reference is required.")
+        elif interest_amount <= 0:
+            st.error("Interest amount must be greater than zero.")
+        else:
+            try:
+                account = w3.eth.account.from_key(borrower_private_key)
+                amount_units = int(round(interest_amount * (10**stablecoin_decimals)))
+
+                allowance = stablecoin.functions.allowance(account.address, contract.address).call()
+                if allowance < amount_units:
+                    approve_tx = stablecoin.functions.approve(contract.address, amount_units).build_transaction(
+                        {
+                            "from": account.address,
+                            "nonce": w3.eth.get_transaction_count(account.address),
+                        }
+                    )
+                    signed_approve = w3.eth.account.sign_transaction(approve_tx, private_key=borrower_private_key)
+                    approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
+                    with st.spinner("Approving stablecoin spend..."):
+                        approve_receipt = w3.eth.wait_for_transaction_receipt(approve_hash)
+                    require_success(approve_receipt)
+
+                tx = contract.functions.payInterest(
+                    pay_mortgage_id, amount_units, payment_reference.strip()
+                ).build_transaction(
+                    {
+                        "from": account.address,
+                        "nonce": w3.eth.get_transaction_count(account.address),
+                    }
+                )
+                signed = w3.eth.account.sign_transaction(tx, private_key=borrower_private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                with st.spinner("Waiting for transaction receipt..."):
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+                require_success(receipt)
+
+                settled_events = contract.events.PaymentSettled().process_receipt(receipt)
+                if settled_events:
+                    args = settled_events[0]["args"]
+                    st.success(
+                        f"Interest payment #{args['paymentIndex']} of {interest_amount} settled to {args['recipient']}."
+                    )
+                else:
+                    st.success("Transaction confirmed, but no PaymentSettled event was found.")
                 st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
             except Exception as e:
                 st.error(f"Transaction failed: {e}")
@@ -265,6 +456,7 @@ with tab_lookup:
                 m = contract.functions.getMortgage(mortgage_id).call()
                 holder = contract.functions.currentTokenholder(mortgage_id).call()
                 doc_hashes = contract.functions.getDocumentHashes(mortgage_id).call()
+                payment_records = contract.functions.getPaymentRecords(mortgage_id).call()
 
                 lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
 
@@ -283,5 +475,24 @@ with tab_lookup:
                 st.markdown(f"**Loan disbursement confirmed:** {'✅ yes' if m[11] else '❌ no'}")
                 st.markdown(f"**Disbursement reference:** {m[12] or 'none'}")
                 st.markdown(f"**Document hashes:** {[h.hex() for h in doc_hashes] or 'none'}")
+
+                payment_status_labels = ["Pending", "Paid", "Late", "Missed"]
+                lookup_decimals = 18
+                if m[5] != "0x0000000000000000000000000000000000000000":
+                    try:
+                        lookup_decimals = w3.eth.contract(
+                            address=Web3.to_checksum_address(m[5]), abi=ERC20_ABI
+                        ).functions.decimals().call()
+                    except Exception:
+                        pass
+
+                st.markdown(f"**Payment records:** {len(payment_records) or 'none'}")
+                for i, record in enumerate(payment_records):
+                    amount_display = record[1] / (10**lookup_decimals)
+                    st.markdown(
+                        f"- #{i}: {amount_display} at {format_status_timestamp(record[5])} — "
+                        f"{payment_status_labels[record[2]]}, payer `{record[3]}`, recipient `{record[4]}`, "
+                        f"ref \"{record[6]}\""
+                    )
             except Exception as e:
                 st.error(f"Lookup failed: {e}")

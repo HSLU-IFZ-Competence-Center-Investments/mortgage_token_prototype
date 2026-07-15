@@ -20,3 +20,6 @@ docs/
 !.env.example
 
 .DS_Store
+
+# Streamlit frontend local state (RPC url / contract address)
+frontend/.frontend_state.json

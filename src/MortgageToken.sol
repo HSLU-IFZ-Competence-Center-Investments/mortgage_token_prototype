@@ -35,6 +35,12 @@ contract MortgageToken is ERC721, Ownable {
         uint256 interestRateBps;
     }
 
+    struct LegalSetup {
+        bool confirmed;
+        string loanAgreementId;
+        string landRegistryExtractId;
+    }
+
     struct PaymentRecord {
         uint256 dueDate;
         uint256 amount;
@@ -54,6 +60,9 @@ contract MortgageToken is ERC721, Ownable {
         PaymentMode paymentMode;
         address stablecoinAddress;
         LifecycleStatus status;
+        bool legalSetupConfirmed;
+        string loanAgreementId;
+        string landRegistryExtractId;
     }
 
     uint256 private _nextMortgageId = 1;
@@ -71,16 +80,23 @@ contract MortgageToken is ERC721, Ownable {
 
     constructor(address initialOwner) ERC721("MortgageToken", "MORT") Ownable(initialOwner) {}
 
+    /// @notice Mints a mortgage token. Off-chain origination and legal setup
+    /// (e.g. loan agreement execution, land registry filing) must be confirmed
+    /// complete via legalSetup_.confirmed before the token can be minted.
     function createMortgage(
         address borrower_,
         address investor_,
         bytes32[] calldata documentHashes_,
         MortgageTerms calldata terms_,
         PaymentMode paymentMode_,
-        address stablecoinAddress_
+        address stablecoinAddress_,
+        LegalSetup calldata legalSetup_
     ) external onlyOwner returns (uint256 mortgageId) {
         require(borrower_ != address(0), "borrower is zero address");
         require(investor_ != address(0), "investor is zero address");
+        require(legalSetup_.confirmed, "legal setup must be confirmed before minting");
+        require(bytes(legalSetup_.loanAgreementId).length != 0, "loan agreement ID required");
+        require(bytes(legalSetup_.landRegistryExtractId).length != 0, "land registry extract ID required");
         if (paymentMode_ == PaymentMode.Stablecoin) {
             require(stablecoinAddress_ != address(0), "stablecoin address required");
         } else {
@@ -97,7 +113,10 @@ contract MortgageToken is ERC721, Ownable {
             terms: terms_,
             paymentMode: paymentMode_,
             stablecoinAddress: stablecoinAddress_,
-            status: LifecycleStatus.Created
+            status: LifecycleStatus.Created,
+            legalSetupConfirmed: legalSetup_.confirmed,
+            loanAgreementId: legalSetup_.loanAgreementId,
+            landRegistryExtractId: legalSetup_.landRegistryExtractId
         });
 
         _documentHashes[mortgageId] = documentHashes_;
@@ -105,5 +124,17 @@ contract MortgageToken is ERC721, Ownable {
         _safeMint(investor_, mortgageId);
 
         emit MortgageCreated(mortgageId, borrower_, investor_);
+    }
+
+    function getMortgage(uint256 mortgageId) external view returns (Mortgage memory) {
+        return _mortgages[mortgageId];
+    }
+
+    function getDocumentHashes(uint256 mortgageId) external view returns (bytes32[] memory) {
+        return _documentHashes[mortgageId];
+    }
+
+    function currentTokenholder(uint256 mortgageId) external view returns (address) {
+        return ownerOf(mortgageId);
     }
 }

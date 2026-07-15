@@ -7,11 +7,6 @@ import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 /// @notice Each ERC-721 token represents one mortgage;
 /// the current tokenholder is the ERC-721 owner of that token.
 contract MortgageToken is ERC721, Ownable {
-    enum PaymentMode {
-        SIC,
-        Stablecoin
-    }
-
     enum LifecycleStatus {
         Created,
         Disbursed,
@@ -41,6 +36,11 @@ contract MortgageToken is ERC721, Ownable {
         string landRegistryExtractId;
     }
 
+    struct LoanDisbursement {
+        bool confirmed;
+        string disbursementReference;
+    }
+
     struct PaymentRecord {
         uint256 dueDate;
         uint256 amount;
@@ -57,12 +57,14 @@ contract MortgageToken is ERC721, Ownable {
         address borrower;
         address investor;
         MortgageTerms terms;
-        PaymentMode paymentMode;
         address stablecoinAddress;
         LifecycleStatus status;
+        uint256 statusChangedAt;
         bool legalSetupConfirmed;
         string loanAgreementId;
         string landRegistryExtractId;
+        bool loanDisbursementConfirmed;
+        string disbursementReference;
     }
 
     uint256 private _nextMortgageId = 1;
@@ -72,6 +74,7 @@ contract MortgageToken is ERC721, Ownable {
     mapping(uint256 => PaymentRecord[]) private _paymentRecords;
 
     event MortgageCreated(uint256 indexed mortgageId, address indexed borrower, address indexed investor);
+    event TokenTransferredToInvestor(uint256 indexed mortgageId, address indexed investor);
     event DocumentHashAdded(uint256 indexed mortgageId, bytes32 documentHash);
     event LifecycleStatusChanged(uint256 indexed mortgageId, LifecycleStatus previousStatus, LifecycleStatus newStatus);
     event PaymentScheduled(uint256 indexed mortgageId, uint256 indexed paymentIndex, uint256 dueDate, uint256 amount);
@@ -80,28 +83,29 @@ contract MortgageToken is ERC721, Ownable {
 
     constructor(address initialOwner) ERC721("MortgageToken", "MORT") Ownable(initialOwner) {}
 
-    /// @notice Mints a mortgage token. Off-chain origination and legal setup
-    /// (e.g. loan agreement execution, land registry filing) must be confirmed
-    /// complete via legalSetup_.confirmed before the token can be minted.
+    /// @notice Mints a mortgage token to the issuer/processor (the caller). Off-chain
+    /// origination and legal setup (e.g. loan agreement execution, land registry filing)
+    /// must be confirmed complete via legalSetup_.confirmed, and loan disbursement
+    /// (fiat via SIC) must be confirmed complete via loanDisbursement_.confirmed, before
+    /// the token can be minted. Interest payments are always settled on-chain in the
+    /// given stablecoin. Use transferTokenToInvestor to move the token to the investor.
     function createMortgage(
         address borrower_,
         address investor_,
         bytes32[] calldata documentHashes_,
         MortgageTerms calldata terms_,
-        PaymentMode paymentMode_,
         address stablecoinAddress_,
-        LegalSetup calldata legalSetup_
+        LegalSetup calldata legalSetup_,
+        LoanDisbursement calldata loanDisbursement_
     ) external onlyOwner returns (uint256 mortgageId) {
         require(borrower_ != address(0), "borrower is zero address");
         require(investor_ != address(0), "investor is zero address");
         require(legalSetup_.confirmed, "legal setup must be confirmed before minting");
         require(bytes(legalSetup_.loanAgreementId).length != 0, "loan agreement ID required");
         require(bytes(legalSetup_.landRegistryExtractId).length != 0, "land registry extract ID required");
-        if (paymentMode_ == PaymentMode.Stablecoin) {
-            require(stablecoinAddress_ != address(0), "stablecoin address required");
-        } else {
-            require(stablecoinAddress_ == address(0), "stablecoin address not allowed for SIC mode");
-        }
+        require(loanDisbursement_.confirmed, "loan disbursement must be confirmed before minting");
+        require(bytes(loanDisbursement_.disbursementReference).length != 0, "disbursement reference required");
+        require(stablecoinAddress_ != address(0), "stablecoin address required");
 
         mortgageId = _nextMortgageId++;
 
@@ -111,19 +115,38 @@ contract MortgageToken is ERC721, Ownable {
             borrower: borrower_,
             investor: investor_,
             terms: terms_,
-            paymentMode: paymentMode_,
             stablecoinAddress: stablecoinAddress_,
             status: LifecycleStatus.Created,
+            statusChangedAt: block.timestamp,
             legalSetupConfirmed: legalSetup_.confirmed,
             loanAgreementId: legalSetup_.loanAgreementId,
-            landRegistryExtractId: legalSetup_.landRegistryExtractId
+            landRegistryExtractId: legalSetup_.landRegistryExtractId,
+            loanDisbursementConfirmed: loanDisbursement_.confirmed,
+            disbursementReference: loanDisbursement_.disbursementReference
         });
 
         _documentHashes[mortgageId] = documentHashes_;
 
-        _safeMint(investor_, mortgageId);
+        _safeMint(msg.sender, mortgageId);
 
         emit MortgageCreated(mortgageId, borrower_, investor_);
+    }
+
+    /// @notice Transfers the mortgage token from the issuer/processor to the investor
+    /// recorded on the mortgage, and moves the mortgage into Active status.
+    function transferTokenToInvestor(uint256 mortgageId) external onlyOwner {
+        Mortgage storage mortgage = _mortgages[mortgageId];
+        require(mortgage.mortgageId != 0, "mortgage does not exist");
+        require(ownerOf(mortgageId) == mortgage.issuer, "token already transferred to investor");
+
+        _safeTransfer(mortgage.issuer, mortgage.investor, mortgageId, "");
+
+        LifecycleStatus previousStatus = mortgage.status;
+        mortgage.status = LifecycleStatus.Active;
+        mortgage.statusChangedAt = block.timestamp;
+
+        emit TokenTransferredToInvestor(mortgageId, mortgage.investor);
+        emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Active);
     }
 
     function getMortgage(uint256 mortgageId) external view returns (Mortgage memory) {

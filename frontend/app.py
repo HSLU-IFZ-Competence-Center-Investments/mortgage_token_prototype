@@ -9,7 +9,6 @@ from web3 import Web3
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_PATH = ROOT / "out" / "MortgageToken.sol" / "MortgageToken.json"
 STATE_PATH = Path(__file__).resolve().parent / ".frontend_state.json"
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 st.set_page_config(page_title="Mortgage Token Demo", page_icon="\U0001F3E0", layout="centered")
 
@@ -18,6 +17,10 @@ def clean_hex_input(value: str) -> str:
     """Strip whitespace and stray quote characters from a pasted hex string
     (private key or address), which are commonly copied in by accident."""
     return value.strip().strip("'\"").strip()
+
+
+def format_status_timestamp(unix_timestamp: int) -> str:
+    return datetime.fromtimestamp(unix_timestamp).strftime("%H:%M %d-%m-%Y")
 
 
 def load_abi() -> list:
@@ -77,7 +80,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Could not load contract: {e}")
 
-tab_create, tab_lookup = st.tabs(["Create Mortgage", "Look Up Mortgage"])
+tab_create, tab_transfer, tab_lookup = st.tabs(["Create Mortgage", "Transfer to Investor", "Look Up Mortgage"])
 
 with tab_create:
     st.subheader("Create a new mortgage token")
@@ -106,10 +109,9 @@ with tab_create:
         with col6:
             interest_rate_pct = st.number_input("Interest rate (%)", min_value=0.0, value=2.5, step=0.1)
 
-        payment_mode = st.selectbox("Payment mode", ["SIC", "Stablecoin"])
-        stablecoin_address = ""
-        if payment_mode == "Stablecoin":
-            stablecoin_address = st.text_input("Stablecoin address")
+        stablecoin_address = st.text_input(
+            "Stablecoin address", help="ERC-20 stablecoin used to settle interest payments on-chain."
+        )
 
         col7, col8 = st.columns(2)
         with col7:
@@ -128,6 +130,15 @@ with tab_create:
             "have been completed off-chain. Required before the mortgage token can be minted.",
         )
 
+        disbursement_reference = st.text_input(
+            "Disbursement reference", help="SIC payment reference for the fiat loan disbursement to the borrower."
+        )
+        loan_disbursement_confirmed = st.checkbox(
+            "Loan disbursement confirmed",
+            help="Confirms that the fiat loan disbursement to the borrower (via SIC) has been completed off-chain. "
+            "Required before the mortgage token can be minted.",
+        )
+
         submitted = st.form_submit_button("Create Mortgage Token", type="primary")
 
     if submitted:
@@ -137,6 +148,12 @@ with tab_create:
             st.error("Legal setup must be confirmed before the mortgage token can be minted.")
         elif not (loan_agreement_id.strip() and land_registry_extract_id.strip()):
             st.error("Loan agreement ID and land registry extract ID are required.")
+        elif not loan_disbursement_confirmed:
+            st.error("Loan disbursement must be confirmed before the mortgage token can be minted.")
+        elif not disbursement_reference.strip():
+            st.error("Disbursement reference is required.")
+        elif not stablecoin_address.strip():
+            st.error("Stablecoin address is required.")
         else:
             try:
                 account = w3.eth.account.from_key(owner_private_key)
@@ -151,21 +168,14 @@ with tab_create:
                     int(time.mktime(maturity.timetuple())),
                     int(round(interest_rate_pct * 100)),
                 )
-                payment_mode_index = 0 if payment_mode == "SIC" else 1
-                stablecoin_arg = (
-                    Web3.to_checksum_address(clean_hex_input(stablecoin_address))
-                    if stablecoin_address.strip()
-                    else ZERO_ADDRESS
-                )
-
                 tx = contract.functions.createMortgage(
                     Web3.to_checksum_address(clean_hex_input(borrower)),
                     Web3.to_checksum_address(clean_hex_input(investor)),
                     document_hashes,
                     terms,
-                    payment_mode_index,
-                    stablecoin_arg,
+                    Web3.to_checksum_address(clean_hex_input(stablecoin_address)),
                     (legal_setup_confirmed, loan_agreement_id.strip(), land_registry_extract_id.strip()),
+                    (loan_disbursement_confirmed, disbursement_reference.strip()),
                 ).build_transaction(
                     {
                         "from": account.address,
@@ -180,9 +190,65 @@ with tab_create:
                 created_events = contract.events.MortgageCreated().process_receipt(receipt)
                 if created_events:
                     mortgage_id = created_events[0]["args"]["mortgageId"]
-                    st.success(f"Mortgage token #{mortgage_id} created and minted to {investor}.")
+                    st.success(
+                        f"Mortgage token #{mortgage_id} created and minted to the issuer ({account.address}). "
+                        "Use the \"Transfer to Investor\" tab to transfer it to the investor."
+                    )
                 else:
                     st.success("Transaction confirmed, but no MortgageCreated event was found.")
+                st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
+            except Exception as e:
+                st.error(f"Transaction failed: {e}")
+
+with tab_transfer:
+    st.subheader("Transfer token to investor")
+    st.caption(
+        "Transfers the mortgage token from the issuer/processor (who it was minted to) "
+        "to the investor recorded on the mortgage."
+    )
+
+    if not connected:
+        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+    elif contract is None:
+        st.warning("Enter a deployed contract address in the sidebar.")
+
+    transfer_mortgage_id = st.number_input("Mortgage ID", min_value=1, step=1, value=1, key="transfer_mortgage_id")
+
+    if contract is not None:
+        try:
+            m = contract.functions.getMortgage(transfer_mortgage_id).call()
+            holder = contract.functions.currentTokenholder(transfer_mortgage_id).call()
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+            st.markdown(f"**Current tokenholder:** `{holder}`")
+            st.markdown(f"**Issuer:** `{m[1]}`")
+            st.markdown(f"**Investor:** `{m[3]}`")
+            st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
+        except Exception as e:
+            st.error(f"Could not load mortgage: {e}")
+
+    if st.button("Transfer to Investor", type="primary"):
+        if not (connected and contract is not None and owner_private_key):
+            st.error("Missing node connection, contract address, or owner private key.")
+        else:
+            try:
+                account = w3.eth.account.from_key(owner_private_key)
+                tx = contract.functions.transferTokenToInvestor(transfer_mortgage_id).build_transaction(
+                    {
+                        "from": account.address,
+                        "nonce": w3.eth.get_transaction_count(account.address),
+                    }
+                )
+                signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                with st.spinner("Waiting for transaction receipt..."):
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+                transferred_events = contract.events.TokenTransferredToInvestor().process_receipt(receipt)
+                if transferred_events:
+                    investor_addr = transferred_events[0]["args"]["investor"]
+                    st.success(f"Mortgage token #{transfer_mortgage_id} transferred to investor {investor_addr}.")
+                else:
+                    st.success("Transaction confirmed, but no TokenTransferredToInvestor event was found.")
                 st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
             except Exception as e:
                 st.error(f"Transaction failed: {e}")
@@ -201,7 +267,6 @@ with tab_lookup:
                 doc_hashes = contract.functions.getDocumentHashes(mortgage_id).call()
 
                 lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
-                payment_mode_labels = ["SIC", "Stablecoin"]
 
                 st.markdown(f"**Current tokenholder:** `{holder}`")
                 st.markdown(f"**Issuer:** `{m[1]}`")
@@ -210,11 +275,13 @@ with tab_lookup:
                 st.markdown(f"**Principal:** {Web3.from_wei(m[4][0], 'ether')} {m[4][1]}")
                 st.markdown(f"**Maturity date:** {datetime.fromtimestamp(m[4][2]).date()}")
                 st.markdown(f"**Interest rate:** {m[4][3] / 100:.2f}%")
-                st.markdown(f"**Payment mode:** {payment_mode_labels[m[5]]}")
-                st.markdown(f"**Status:** {lifecycle_labels[m[7]]}")
+                st.markdown(f"**Stablecoin address:** `{m[5]}`")
+                st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
                 st.markdown(f"**Legal setup confirmed:** {'✅ yes' if m[8] else '❌ no'}")
                 st.markdown(f"**Loan agreement ID:** {m[9] or 'none'}")
                 st.markdown(f"**Land registry extract ID:** {m[10] or 'none'}")
+                st.markdown(f"**Loan disbursement confirmed:** {'✅ yes' if m[11] else '❌ no'}")
+                st.markdown(f"**Disbursement reference:** {m[12] or 'none'}")
                 st.markdown(f"**Document hashes:** {[h.hex() for h in doc_hashes] or 'none'}")
             except Exception as e:
                 st.error(f"Lookup failed: {e}")

@@ -69,6 +69,8 @@ contract MortgageToken is ERC721, Ownable {
         string landRegistryExtractId;
         bool loanDisbursementConfirmed;
         string disbursementReference;
+        bool principalRepaymentConfirmed;
+        string principalRepaymentReference;
     }
 
     uint256 private _nextMortgageId = 1;
@@ -79,6 +81,9 @@ contract MortgageToken is ERC721, Ownable {
 
     event MortgageCreated(uint256 indexed mortgageId, address indexed borrower, address indexed investor);
     event TokenTransferredToInvestor(uint256 indexed mortgageId, address indexed investor);
+    event PurchasePriceSettled(uint256 indexed mortgageId, address indexed investor, uint256 purchasePrice);
+    event PrincipalRepaymentConfirmed(uint256 indexed mortgageId, string repaymentReference);
+    event TokenRedeemedAndBurned(uint256 indexed mortgageId, address indexed investor, uint256 principalPaymentAmount);
     event DocumentHashAdded(uint256 indexed mortgageId, bytes32 documentHash);
     event LifecycleStatusChanged(uint256 indexed mortgageId, LifecycleStatus previousStatus, LifecycleStatus newStatus);
     event PaymentScheduled(uint256 indexed mortgageId, uint256 indexed paymentIndex, uint256 dueDate, uint256 amount);
@@ -126,7 +131,9 @@ contract MortgageToken is ERC721, Ownable {
             loanAgreementId: legalSetup_.loanAgreementId,
             landRegistryExtractId: legalSetup_.landRegistryExtractId,
             loanDisbursementConfirmed: loanDisbursement_.confirmed,
-            disbursementReference: loanDisbursement_.disbursementReference
+            disbursementReference: loanDisbursement_.disbursementReference,
+            principalRepaymentConfirmed: false,
+            principalRepaymentReference: ""
         });
 
         _documentHashes[mortgageId] = documentHashes_;
@@ -137,12 +144,30 @@ contract MortgageToken is ERC721, Ownable {
         emit MortgageCreated(mortgageId, borrower_, investor_);
     }
 
-    /// @notice Transfers the mortgage token from the issuer/processor to the investor
-    /// recorded on the mortgage, and moves the mortgage into Active status.
-    function transferTokenToInvestor(uint256 mortgageId) external onlyOwner {
+    /// @notice Pulls the investor's stablecoin purchase price (approved beforehand by
+    /// the investor) and forwards it to the issuer/processor, then transfers the
+    /// mortgage token from the issuer/processor to the investor and moves the
+    /// mortgage into Active status.
+    function transferTokenToInvestor(uint256 mortgageId, uint256 purchasePrice_) external onlyOwner {
         Mortgage storage mortgage = _mortgages[mortgageId];
         require(mortgage.mortgageId != 0, "mortgage does not exist");
         require(ownerOf(mortgageId) == mortgage.issuer, "token already transferred to investor");
+        require(purchasePrice_ > 0, "purchase price must be greater than zero");
+
+        IERC20(mortgage.stablecoinAddress).safeTransferFrom(mortgage.investor, mortgage.issuer, purchasePrice_);
+
+        uint256 paymentIndex = _paymentRecords[mortgageId].length;
+        _paymentRecords[mortgageId].push(
+            PaymentRecord({
+                dueDate: 0,
+                amount: purchasePrice_,
+                status: PaymentStatus.Paid,
+                payer: mortgage.investor,
+                recipient: mortgage.issuer,
+                timestamp: block.timestamp,
+                paymentReference: "purchase-price"
+            })
+        );
 
         _safeTransfer(mortgage.issuer, mortgage.investor, mortgageId, "");
 
@@ -150,22 +175,26 @@ contract MortgageToken is ERC721, Ownable {
         mortgage.status = LifecycleStatus.Active;
         mortgage.statusChangedAt = block.timestamp;
 
+        emit PurchasePriceSettled(mortgageId, mortgage.investor, purchasePrice_);
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.investor, mortgage.issuer, "purchase-price");
         emit TokenTransferredToInvestor(mortgageId, mortgage.investor);
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Active);
     }
 
-    /// @notice Pulls a stablecoin interest payment from the borrower and forwards it
-    /// directly to the current tokenholder, recording the payment on-chain.
-    function payInterest(uint256 mortgageId, uint256 amount, string calldata paymentReference_) external {
+    /// @notice Records that the borrower's fiat interest payment was received via SIC,
+    /// and pulls the corresponding stablecoin interest payment from the issuer/processor
+    /// (who must have approved this contract beforehand) forwarding it to the current
+    /// tokenholder. Confirmation and payment are bundled into a single call since the
+    /// issuer/processor is the one party performing both.
+    function payInterest(uint256 mortgageId, uint256 amount, string calldata paymentReference_) external onlyOwner {
         Mortgage storage mortgage = _mortgages[mortgageId];
         require(mortgage.mortgageId != 0, "mortgage does not exist");
         require(mortgage.status == LifecycleStatus.Active, "mortgage not active");
-        require(msg.sender == mortgage.borrower, "only borrower can pay interest");
         require(amount > 0, "amount must be greater than zero");
 
         address recipient = ownerOf(mortgageId);
 
-        IERC20(mortgage.stablecoinAddress).safeTransferFrom(msg.sender, recipient, amount);
+        IERC20(mortgage.stablecoinAddress).safeTransferFrom(mortgage.issuer, recipient, amount);
 
         uint256 paymentIndex = _paymentRecords[mortgageId].length;
         _paymentRecords[mortgageId].push(
@@ -173,14 +202,74 @@ contract MortgageToken is ERC721, Ownable {
                 dueDate: 0,
                 amount: amount,
                 status: PaymentStatus.Paid,
-                payer: msg.sender,
+                payer: mortgage.issuer,
                 recipient: recipient,
                 timestamp: block.timestamp,
                 paymentReference: paymentReference_
             })
         );
 
-        emit PaymentSettled(mortgageId, paymentIndex, msg.sender, recipient, paymentReference_);
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, paymentReference_);
+    }
+
+    /// @notice Records the reference to the fiat principal repayment conducted via
+    /// SIC at maturity, and moves the mortgage into Repaid status. No funds move
+    /// on-chain here — the SIC payment happens off-chain and this only confirms it.
+    function confirmPrincipalRepayment(uint256 mortgageId, string calldata repaymentReference_) external onlyOwner {
+        Mortgage storage mortgage = _mortgages[mortgageId];
+        require(mortgage.mortgageId != 0, "mortgage does not exist");
+        require(mortgage.status == LifecycleStatus.Active, "mortgage not active");
+        require(block.timestamp >= mortgage.terms.maturityDate, "maturity date not reached");
+        require(!mortgage.principalRepaymentConfirmed, "principal repayment already confirmed");
+        require(bytes(repaymentReference_).length != 0, "repayment reference required");
+
+        mortgage.principalRepaymentConfirmed = true;
+        mortgage.principalRepaymentReference = repaymentReference_;
+
+        LifecycleStatus previousStatus = mortgage.status;
+        mortgage.status = LifecycleStatus.Repaid;
+        mortgage.statusChangedAt = block.timestamp;
+
+        emit PrincipalRepaymentConfirmed(mortgageId, repaymentReference_);
+        emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Repaid);
+    }
+
+    /// @notice Pulls the stablecoin principal redemption payment from the issuer/processor
+    /// (who must have approved this contract beforehand) forwarding it to the current
+    /// tokenholder, then burns the mortgage token and moves the mortgage into Closed
+    /// status. Requires confirmPrincipalRepayment to have been called first.
+    function redeemAndBurnToken(uint256 mortgageId, uint256 principalPaymentAmount_) external onlyOwner {
+        Mortgage storage mortgage = _mortgages[mortgageId];
+        require(mortgage.mortgageId != 0, "mortgage does not exist");
+        require(mortgage.status == LifecycleStatus.Repaid, "principal repayment not confirmed");
+        require(principalPaymentAmount_ > 0, "principal payment amount must be greater than zero");
+
+        address recipient = ownerOf(mortgageId);
+
+        IERC20(mortgage.stablecoinAddress).safeTransferFrom(mortgage.issuer, recipient, principalPaymentAmount_);
+
+        uint256 paymentIndex = _paymentRecords[mortgageId].length;
+        _paymentRecords[mortgageId].push(
+            PaymentRecord({
+                dueDate: 0,
+                amount: principalPaymentAmount_,
+                status: PaymentStatus.Paid,
+                payer: mortgage.issuer,
+                recipient: recipient,
+                timestamp: block.timestamp,
+                paymentReference: "principal-redemption"
+            })
+        );
+
+        _burn(mortgageId);
+
+        LifecycleStatus previousStatus = mortgage.status;
+        mortgage.status = LifecycleStatus.Closed;
+        mortgage.statusChangedAt = block.timestamp;
+
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "principal-redemption");
+        emit TokenRedeemedAndBurned(mortgageId, recipient, principalPaymentAmount_);
+        emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Closed);
     }
 
     function getMortgage(uint256 mortgageId) external view returns (Mortgage memory) {

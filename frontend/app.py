@@ -505,13 +505,16 @@ with tab_pay:
 
     st.caption("Uses the owner/issuer private key from the sidebar — payInterest is issuer/processor-only.")
     interest_amount = st.number_input("Interest amount", min_value=0.0, value=1000.0, step=10.0, key="interest_amount")
-    payment_reference = st.text_input("Payment reference", key="payment_reference")
+    fiat_payment_reference = st.text_input("Fiat payment reference (borrower's SIC payment)", key="fiat_payment_reference")
+    payment_reference = st.text_input("Stablecoin payment reference", key="payment_reference")
 
     if st.button("Pay Interest", type="primary"):
         if not (connected and contract is not None and stablecoin is not None and owner_private_key):
             st.error("Missing node connection, contract address, or owner private key.")
+        elif not fiat_payment_reference.strip():
+            st.error("Fiat payment reference is required.")
         elif not payment_reference.strip():
-            st.error("Payment reference is required.")
+            st.error("Stablecoin payment reference is required.")
         elif interest_amount <= 0:
             st.error("Interest amount must be greater than zero.")
         else:
@@ -534,7 +537,7 @@ with tab_pay:
                     require_success(approve_receipt)
 
                 tx = contract.functions.payInterest(
-                    pay_mortgage_id, amount_units, payment_reference.strip()
+                    pay_mortgage_id, amount_units, fiat_payment_reference.strip(), payment_reference.strip()
                 ).build_transaction(
                     {
                         "from": account.address,
@@ -771,7 +774,7 @@ with tab_lookup:
                     st.markdown(
                         f"- #{i}: {amount_display} at {format_status_timestamp(record[5])} — "
                         f"{payment_status_labels[record[2]]}, payer `{record[3]}`, recipient `{record[4]}`, "
-                        f"ref \"{record[6]}\""
+                        f"fiat ref \"{record[6]}\", stablecoin ref \"{record[7]}\""
                     )
             except Exception as e:
                 st.error(f"Lookup failed: {e}")

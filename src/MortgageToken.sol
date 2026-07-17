@@ -52,6 +52,7 @@ contract MortgageToken is ERC721, Ownable {
         address payer;
         address recipient;
         uint256 timestamp;
+        string fiatReference;
         string paymentReference;
     }
 
@@ -87,7 +88,7 @@ contract MortgageToken is ERC721, Ownable {
     event DocumentHashAdded(uint256 indexed mortgageId, bytes32 documentHash);
     event LifecycleStatusChanged(uint256 indexed mortgageId, LifecycleStatus previousStatus, LifecycleStatus newStatus);
     event PaymentScheduled(uint256 indexed mortgageId, uint256 indexed paymentIndex, uint256 dueDate, uint256 amount);
-    event PaymentSettled(uint256 indexed mortgageId, uint256 indexed paymentIndex, address payer, address recipient, string paymentReference);
+    event PaymentSettled(uint256 indexed mortgageId, uint256 indexed paymentIndex, address payer, address recipient, string fiatReference, string paymentReference);
     event PaymentStatusUpdated(uint256 indexed mortgageId, uint256 indexed paymentIndex, PaymentStatus status);
 
     constructor(address initialOwner) ERC721("MortgageToken", "MORT") Ownable(initialOwner) {}
@@ -165,6 +166,7 @@ contract MortgageToken is ERC721, Ownable {
                 payer: mortgage.investor,
                 recipient: mortgage.issuer,
                 timestamp: block.timestamp,
+                fiatReference: "",
                 paymentReference: "purchase-price"
             })
         );
@@ -176,21 +178,28 @@ contract MortgageToken is ERC721, Ownable {
         mortgage.statusChangedAt = block.timestamp;
 
         emit PurchasePriceSettled(mortgageId, mortgage.investor, purchasePrice_);
-        emit PaymentSettled(mortgageId, paymentIndex, mortgage.investor, mortgage.issuer, "purchase-price");
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.investor, mortgage.issuer, "", "purchase-price");
         emit TokenTransferredToInvestor(mortgageId, mortgage.investor);
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Active);
     }
 
-    /// @notice Records that the borrower's fiat interest payment was received via SIC,
-    /// and pulls the corresponding stablecoin interest payment from the issuer/processor
-    /// (who must have approved this contract beforehand) forwarding it to the current
-    /// tokenholder. Confirmation and payment are bundled into a single call since the
-    /// issuer/processor is the one party performing both.
-    function payInterest(uint256 mortgageId, uint256 amount, string calldata paymentReference_) external onlyOwner {
+    /// @notice Records that the borrower's fiat interest payment was received via SIC
+    /// (fiatPaymentReference_), and pulls the corresponding stablecoin interest payment
+    /// from the issuer/processor (who must have approved this contract beforehand)
+    /// forwarding it to the current tokenholder (stablecoinPaymentReference_). Confirmation
+    /// and payment are bundled into a single call since the issuer/processor is the one
+    /// party performing both.
+    function payInterest(
+        uint256 mortgageId,
+        uint256 amount,
+        string calldata fiatPaymentReference_,
+        string calldata stablecoinPaymentReference_
+    ) external onlyOwner {
         Mortgage storage mortgage = _mortgages[mortgageId];
         require(mortgage.mortgageId != 0, "mortgage does not exist");
         require(mortgage.status == LifecycleStatus.Active, "mortgage not active");
         require(amount > 0, "amount must be greater than zero");
+        require(bytes(fiatPaymentReference_).length != 0, "fiat payment reference required");
 
         address recipient = ownerOf(mortgageId);
 
@@ -205,11 +214,12 @@ contract MortgageToken is ERC721, Ownable {
                 payer: mortgage.issuer,
                 recipient: recipient,
                 timestamp: block.timestamp,
-                paymentReference: paymentReference_
+                fiatReference: fiatPaymentReference_,
+                paymentReference: stablecoinPaymentReference_
             })
         );
 
-        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, paymentReference_);
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, fiatPaymentReference_, stablecoinPaymentReference_);
     }
 
     /// @notice Records the reference to the fiat principal repayment conducted via
@@ -257,6 +267,7 @@ contract MortgageToken is ERC721, Ownable {
                 payer: mortgage.issuer,
                 recipient: recipient,
                 timestamp: block.timestamp,
+                fiatReference: "",
                 paymentReference: "principal-redemption"
             })
         );
@@ -267,7 +278,7 @@ contract MortgageToken is ERC721, Ownable {
         mortgage.status = LifecycleStatus.Closed;
         mortgage.statusChangedAt = block.timestamp;
 
-        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "principal-redemption");
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "", "principal-redemption");
         emit TokenRedeemedAndBurned(mortgageId, recipient, principalPaymentAmount_);
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Closed);
     }

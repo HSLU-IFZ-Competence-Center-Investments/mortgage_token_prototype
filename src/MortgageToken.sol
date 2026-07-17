@@ -59,7 +59,7 @@ contract MortgageToken is ERC721, Ownable {
     struct Mortgage {
         uint256 mortgageId;
         address issuer;
-        address borrower;
+        string borrower;
         address investor;
         MortgageTerms terms;
         address stablecoinAddress;
@@ -80,7 +80,7 @@ contract MortgageToken is ERC721, Ownable {
     mapping(uint256 => bytes32[]) private _documentHashes;
     mapping(uint256 => PaymentRecord[]) private _paymentRecords;
 
-    event MortgageCreated(uint256 indexed mortgageId, address indexed borrower, address indexed investor);
+    event MortgageCreated(uint256 indexed mortgageId, string borrower, address indexed investor);
     event TokenTransferredToInvestor(uint256 indexed mortgageId, address indexed investor);
     event PurchasePriceSettled(uint256 indexed mortgageId, address indexed investor, uint256 purchasePrice);
     event PrincipalRepaymentConfirmed(uint256 indexed mortgageId, string repaymentReference);
@@ -100,7 +100,7 @@ contract MortgageToken is ERC721, Ownable {
     /// the token can be minted. Interest payments are always settled on-chain in the
     /// given stablecoin. Use transferTokenToInvestor to move the token to the investor.
     function createMortgage(
-        address borrower_,
+        string calldata borrower_,
         address investor_,
         bytes32[] calldata documentHashes_,
         MortgageTerms calldata terms_,
@@ -108,7 +108,7 @@ contract MortgageToken is ERC721, Ownable {
         LegalSetup calldata legalSetup_,
         LoanDisbursement calldata loanDisbursement_
     ) external onlyOwner returns (uint256 mortgageId) {
-        require(borrower_ != address(0), "borrower is zero address");
+        require(bytes(borrower_).length != 0, "borrower reference required");
         require(investor_ != address(0), "investor is zero address");
         require(legalSetup_.confirmed, "legal setup must be confirmed before minting");
         require(bytes(legalSetup_.loanAgreementId).length != 0, "loan agreement ID required");

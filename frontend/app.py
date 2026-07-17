@@ -236,7 +236,13 @@ with tab_create:
     with st.form("create_mortgage_form"):
         col1, col2 = st.columns(2)
         with col1:
-            borrower = st.text_input("Borrower address")
+            borrower = st.text_input(
+                "Borrower reference",
+                value="Peter Müller",
+                help="An off-chain identifier for the borrower (e.g. a name or customer ID). "
+                "The borrower has no blockchain address — they never interact with the contract; "
+                "this is a reference field only.",
+            )
         with col2:
             investor = st.text_input("Investor address")
 
@@ -294,6 +300,8 @@ with tab_create:
             st.error("Missing node connection, contract address, or owner private key.")
         elif not legal_setup_confirmed:
             st.error("Legal setup must be confirmed before the mortgage token can be minted.")
+        elif not borrower.strip():
+            st.error("Borrower reference is required.")
         elif not (loan_agreement_id.strip() and land_registry_extract_id.strip()):
             st.error("Loan agreement ID and land registry extract ID are required.")
         elif not loan_disbursement_confirmed:
@@ -317,7 +325,7 @@ with tab_create:
                     int(round(interest_rate_pct * 100)),
                 )
                 tx = contract.functions.createMortgage(
-                    Web3.to_checksum_address(clean_hex_input(borrower)),
+                    borrower.strip(),
                     Web3.to_checksum_address(clean_hex_input(investor)),
                     document_hashes,
                     terms,

@@ -17,6 +17,7 @@ contract MortgageToken is ERC721, Ownable {
         Active,
         Matured,
         Repaid,
+        Redeemed,
         Closed
     }
 
@@ -91,7 +92,8 @@ contract MortgageToken is ERC721, Ownable {
     event TokenTransferredToInvestor(uint256 indexed mortgageId, address indexed investor);
     event PurchasePriceSettled(uint256 indexed mortgageId, address indexed investor, uint256 purchasePrice);
     event PrincipalRepaymentConfirmed(uint256 indexed mortgageId, string repaymentReference);
-    event TokenRedeemedAndBurned(uint256 indexed mortgageId, address indexed investor, uint256 principalPaymentAmount);
+    event TokenRedeemed(uint256 indexed mortgageId, address indexed investor, uint256 principalPaymentAmount);
+    event TokenBurned(uint256 indexed mortgageId, address indexed issuer);
     event DocumentHashAdded(uint256 indexed mortgageId, bytes32 documentHash);
     event LifecycleStatusChanged(uint256 indexed mortgageId, LifecycleStatus previousStatus, LifecycleStatus newStatus);
     event PaymentScheduled(uint256 indexed mortgageId, uint256 indexed paymentIndex, uint256 dueDate, uint256 amount);
@@ -270,9 +272,11 @@ contract MortgageToken is ERC721, Ownable {
 
     /// @notice Pulls the stablecoin principal redemption payment from the issuer/processor
     /// (who must have approved this contract beforehand) forwarding it to the current
-    /// tokenholder, then burns the mortgage token and moves the mortgage into Closed
-    /// status. Requires confirmPrincipalRepayment to have been called first.
-    function redeemAndBurnToken(uint256 mortgageId, uint256 principalPaymentAmount_) external onlyOwner {
+    /// tokenholder (the investor), then transfers the mortgage token back from the
+    /// investor to the issuer/processor and moves the mortgage into Redeemed status.
+    /// Requires confirmPrincipalRepayment to have been called first. Use burnToken
+    /// afterwards to close out the mortgage.
+    function redeemToken(uint256 mortgageId, uint256 principalPaymentAmount_) external onlyOwner {
         Mortgage storage mortgage = _mortgages[mortgageId];
         require(mortgage.mortgageId != 0, "mortgage does not exist");
         require(mortgage.status == LifecycleStatus.Repaid, "principal repayment not confirmed");
@@ -297,14 +301,32 @@ contract MortgageToken is ERC721, Ownable {
             })
         );
 
+        _safeTransfer(recipient, mortgage.issuer, mortgageId, "");
+
+        LifecycleStatus previousStatus = mortgage.status;
+        mortgage.status = LifecycleStatus.Redeemed;
+        mortgage.statusChangedAt = block.timestamp;
+
+        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "", "", PaymentCategory.PrincipalRedemption);
+        emit TokenRedeemed(mortgageId, recipient, principalPaymentAmount_);
+        emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Redeemed);
+    }
+
+    /// @notice Burns the mortgage token (held by the issuer/processor after redeemToken)
+    /// and moves the mortgage into Closed status. Requires redeemToken to have been
+    /// called first.
+    function burnToken(uint256 mortgageId) external onlyOwner {
+        Mortgage storage mortgage = _mortgages[mortgageId];
+        require(mortgage.mortgageId != 0, "mortgage does not exist");
+        require(mortgage.status == LifecycleStatus.Redeemed, "token not redeemed");
+
         _burn(mortgageId);
 
         LifecycleStatus previousStatus = mortgage.status;
         mortgage.status = LifecycleStatus.Closed;
         mortgage.statusChangedAt = block.timestamp;
 
-        emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "", "", PaymentCategory.PrincipalRedemption);
-        emit TokenRedeemedAndBurned(mortgageId, recipient, principalPaymentAmount_);
+        emit TokenBurned(mortgageId, mortgage.issuer);
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Closed);
     }
 

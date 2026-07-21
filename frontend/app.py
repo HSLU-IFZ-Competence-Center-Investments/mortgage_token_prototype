@@ -220,8 +220,16 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Balance check failed: {e}")
 
-tab_create, tab_transfer, tab_pay, tab_repay, tab_redeem, tab_lookup = st.tabs(
-    ["Create Mortgage", "Transfer to Investor", "Pay Interest", "Confirm Repayment", "Redeem & Burn", "Look Up Mortgage"]
+tab_create, tab_transfer, tab_pay, tab_repay, tab_redeem, tab_burn, tab_lookup = st.tabs(
+    [
+        "Create Mortgage",
+        "Transfer to Investor",
+        "Pay Interest",
+        "Confirm Repayment",
+        "Redeem",
+        "Burn",
+        "Look Up Mortgage",
+    ]
 )
 
 with tab_create:
@@ -374,7 +382,7 @@ with tab_transfer:
         try:
             m = contract.functions.getMortgage(transfer_mortgage_id).call()
             holder = contract.functions.currentTokenholder(transfer_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
             st.markdown(f"**Current tokenholder:** `{holder}`")
             st.markdown(f"**Issuer:** `{m[1]}`")
             st.markdown(f"**Investor:** `{m[3]}`")
@@ -504,7 +512,7 @@ with tab_pay:
         try:
             m = contract.functions.getMortgage(pay_mortgage_id).call()
             holder = contract.functions.currentTokenholder(pay_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
             st.markdown(f"**Borrower:** `{m[2]}`")
             st.markdown(f"**Current tokenholder (recipient):** `{holder}`")
             st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
@@ -610,7 +618,7 @@ with tab_repay:
     if contract is not None:
         try:
             m = contract.functions.getMortgage(repay_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
             st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
             st.markdown(f"**Maturity date:** {datetime.fromtimestamp(m[4][2]).date()}")
             st.markdown(f"**Principal repayment confirmed:** {'✅ yes' if m[13] else '❌ no'}")
@@ -653,11 +661,12 @@ with tab_repay:
                 st.error(f"Transaction failed: {e}")
 
 with tab_redeem:
-    st.subheader("Redeem and burn token")
+    st.subheader("Redeem token")
     st.caption(
         "Pulls the stablecoin principal redemption payment from the issuer/processor's wallet, forwards "
-        "it to the current tokenholder, then burns the mortgage token. Requires principal repayment to "
-        "have already been confirmed on the \"Confirm Repayment\" tab."
+        "it to the investor (the current tokenholder), then transfers the mortgage token back from the "
+        "investor to the issuer. Requires principal repayment to have already been confirmed on the "
+        "\"Confirm Repayment\" tab. Use the \"Burn\" tab afterwards to close out the mortgage."
     )
 
     if not connected:
@@ -674,8 +683,9 @@ with tab_redeem:
         try:
             m = contract.functions.getMortgage(redeem_mortgage_id).call()
             holder = contract.functions.currentTokenholder(redeem_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
-            st.markdown(f"**Current tokenholder (recipient):** `{holder}`")
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            st.markdown(f"**Current tokenholder (investor):** `{holder}`")
+            st.markdown(f"**Issuer:** `{m[1]}`")
             st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
             st.markdown(f"**Principal repayment confirmed:** {'✅ yes' if m[13] else '❌ no'}")
 
@@ -701,7 +711,7 @@ with tab_redeem:
         key="principal_payment_amount",
     )
 
-    if st.button("Redeem and Burn Token", type="primary"):
+    if st.button("Redeem Token", type="primary"):
         if not (connected and contract is not None and redeem_stablecoin is not None and owner_private_key):
             st.error("Missing node connection, contract address, or owner private key.")
         elif principal_payment_amount <= 0:
@@ -727,7 +737,7 @@ with tab_redeem:
                         approve_receipt = w3.eth.wait_for_transaction_receipt(approve_hash)
                     require_success(approve_receipt)
 
-                tx = contract.functions.redeemAndBurnToken(
+                tx = contract.functions.redeemToken(
                     redeem_mortgage_id, principal_units
                 ).build_transaction(
                     {
@@ -741,15 +751,72 @@ with tab_redeem:
                     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
                 require_success(receipt)
 
-                redeemed_events = contract.events.TokenRedeemedAndBurned().process_receipt(receipt)
+                redeemed_events = contract.events.TokenRedeemed().process_receipt(receipt)
                 if redeemed_events:
                     args = redeemed_events[0]["args"]
                     st.success(
                         f"Mortgage token #{redeem_mortgage_id} redeemed ({principal_payment_amount} paid to "
-                        f"{args['investor']}) and burned."
+                        f"{args['investor']}) and transferred back to the issuer. Use the \"Burn\" tab to "
+                        "close out the mortgage."
                     )
                 else:
-                    st.success("Transaction confirmed, but no TokenRedeemedAndBurned event was found.")
+                    st.success("Transaction confirmed, but no TokenRedeemed event was found.")
+                st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
+            except Exception as e:
+                st.error(f"Transaction failed: {e}")
+
+with tab_burn:
+    st.subheader("Burn token")
+    st.caption(
+        "Burns the mortgage token, held by the issuer/processor after redemption, and closes out the "
+        "mortgage. Requires the token to have already been redeemed on the \"Redeem\" tab."
+    )
+
+    if not connected:
+        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+    elif contract is None:
+        st.warning("Enter a deployed contract address in the sidebar.")
+
+    burn_mortgage_id = st.number_input("Mortgage ID", min_value=1, step=1, value=1, key="burn_mortgage_id")
+
+    if contract is not None:
+        try:
+            m = contract.functions.getMortgage(burn_mortgage_id).call()
+            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            try:
+                holder = contract.functions.currentTokenholder(burn_mortgage_id).call()
+                st.markdown(f"**Current tokenholder (issuer):** `{holder}`")
+            except Exception:
+                st.markdown("**Current tokenholder:** 🔥 token already burned")
+            st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
+        except Exception as e:
+            st.error(f"Could not load mortgage: {e}")
+
+    if st.button("Burn Token", type="primary"):
+        if not (connected and contract is not None and owner_private_key):
+            st.error("Missing node connection, contract address, or owner private key.")
+        else:
+            try:
+                account = w3.eth.account.from_key(owner_private_key)
+
+                tx = contract.functions.burnToken(burn_mortgage_id).build_transaction(
+                    {
+                        "from": account.address,
+                        "nonce": w3.eth.get_transaction_count(account.address),
+                    }
+                )
+                signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                with st.spinner("Waiting for transaction receipt..."):
+                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+                require_success(receipt)
+
+                burned_events = contract.events.TokenBurned().process_receipt(receipt)
+                if burned_events:
+                    args = burned_events[0]["args"]
+                    st.success(f"Mortgage token #{burn_mortgage_id} burned by issuer {args['issuer']}.")
+                else:
+                    st.success("Transaction confirmed, but no TokenBurned event was found.")
                 st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
             except Exception as e:
                 st.error(f"Transaction failed: {e}")
@@ -764,13 +831,16 @@ with tab_lookup:
         if st.button("Look up"):
             try:
                 m = contract.functions.getMortgage(mortgage_id).call()
-                holder = contract.functions.currentTokenholder(mortgage_id).call()
                 doc_hashes = contract.functions.getDocumentHashes(mortgage_id).call()
                 payment_records = contract.functions.getPaymentRecords(mortgage_id).call()
 
-                lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Closed"]
+                lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
 
-                st.markdown(f"**Current tokenholder:** `{holder}`")
+                try:
+                    holder = contract.functions.currentTokenholder(mortgage_id).call()
+                    st.markdown(f"**Current tokenholder:** `{holder}`")
+                except Exception:
+                    st.markdown("**Current tokenholder:** 🔥 token burned — see payment history below")
                 st.markdown(f"**Issuer:** `{m[1]}`")
                 st.markdown(f"**Borrower:** `{m[2]}`")
                 st.markdown(f"**Investor:** `{m[3]}`")

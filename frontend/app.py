@@ -130,7 +130,6 @@ with st.sidebar:
 
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     connected = w3.is_connected()
-    st.markdown(f"**Node status:** {'\U0001F7E2 connected' if connected else '\U0001F534 not connected'}")
 
     contract = None
     if connected and contract_address:
@@ -234,17 +233,13 @@ with tab_create:
         st.warning("Enter a deployed contract address in the sidebar.")
 
     with st.form("create_mortgage_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            borrower = st.text_input(
-                "Borrower reference",
-                value="Peter Müller",
-                help="An off-chain identifier for the borrower (e.g. a name or customer ID). "
-                "The borrower has no blockchain address — they never interact with the contract; "
-                "this is a reference field only.",
-            )
-        with col2:
-            investor = st.text_input("Investor address")
+        borrower = st.text_input(
+            "Borrower reference",
+            value="Peter Müller",
+            help="An off-chain identifier for the borrower (e.g. a name or customer ID). "
+            "The borrower has no blockchain address — they never interact with the contract; "
+            "this is a reference field only.",
+        )
 
         col3, col4 = st.columns(2)
         with col3:
@@ -285,7 +280,8 @@ with tab_create:
         )
 
         disbursement_reference = st.text_input(
-            "Disbursement reference", help="SIC payment reference for the fiat loan disbursement to the borrower."
+            "Fiat payment reference for disbursement",
+            help="SIC payment reference for the fiat loan disbursement to the borrower.",
         )
         loan_disbursement_confirmed = st.checkbox(
             "Loan disbursement confirmed",
@@ -307,7 +303,7 @@ with tab_create:
         elif not loan_disbursement_confirmed:
             st.error("Loan disbursement must be confirmed before the mortgage token can be minted.")
         elif not disbursement_reference.strip():
-            st.error("Disbursement reference is required.")
+            st.error("Fiat payment reference for disbursement is required.")
         elif not stablecoin_address.strip():
             st.error("Stablecoin address is required.")
         else:
@@ -326,7 +322,6 @@ with tab_create:
                 )
                 tx = contract.functions.createMortgage(
                     borrower.strip(),
-                    Web3.to_checksum_address(clean_hex_input(investor)),
                     document_hashes,
                     terms,
                     Web3.to_checksum_address(clean_hex_input(stablecoin_address)),
@@ -403,11 +398,17 @@ with tab_transfer:
     purchase_price = st.number_input(
         "Purchase price", min_value=0.0, value=default_purchase_price, step=1000.0, key="purchase_price"
     )
+    investor_address_input = st.text_input(
+        "Investor address",
+        help="The investor's address, recorded on-chain as the mortgage's investor. Must match the "
+        "address derived from the investor private key below.",
+        key="investor_address",
+    )
     investor_private_key = clean_hex_input(
         st.text_input(
             "Investor private key",
             type="password",
-            help="Used only to sign the stablecoin approval; the investor must approve this contract "
+            help="Used to sign the stablecoin approval; the investor must approve this contract "
             "to spend the purchase price before it can be pulled.",
             key="investor_private_key",
         )
@@ -419,15 +420,23 @@ with tab_transfer:
             and contract is not None
             and transfer_stablecoin is not None
             and owner_private_key
+            and investor_address_input.strip()
             and investor_private_key
         ):
-            st.error("Missing node connection, contract address, owner private key, or investor private key.")
+            st.error("Missing node connection, contract address, owner private key, investor address, or investor private key.")
         elif purchase_price <= 0:
             st.error("Purchase price must be greater than zero.")
         else:
             try:
                 owner_account = w3.eth.account.from_key(owner_private_key)
                 investor_account = w3.eth.account.from_key(investor_private_key)
+                investor_address = Web3.to_checksum_address(clean_hex_input(investor_address_input))
+                if investor_address != investor_account.address:
+                    st.error(
+                        f"Investor address ({investor_address}) does not match the address derived "
+                        f"from the investor private key ({investor_account.address})."
+                    )
+                    st.stop()
                 purchase_price_units = int(round(purchase_price * (10**transfer_stablecoin_decimals)))
 
                 allowance = transfer_stablecoin.functions.allowance(investor_account.address, contract.address).call()
@@ -447,7 +456,7 @@ with tab_transfer:
                     require_success(approve_receipt)
 
                 tx = contract.functions.transferTokenToInvestor(
-                    transfer_mortgage_id, purchase_price_units
+                    transfer_mortgage_id, investor_account.address, purchase_price_units
                 ).build_transaction(
                     {
                         "from": owner_account.address,
@@ -514,15 +523,12 @@ with tab_pay:
     st.caption("Uses the owner/issuer private key from the sidebar — payInterest is issuer/processor-only.")
     interest_amount = st.number_input("Interest amount", min_value=0.0, value=1000.0, step=10.0, key="interest_amount")
     fiat_payment_reference = st.text_input("Fiat payment reference (borrower's SIC payment)", key="fiat_payment_reference")
-    payment_reference = st.text_input("Stablecoin payment reference", key="payment_reference")
 
     if st.button("Pay Interest", type="primary"):
         if not (connected and contract is not None and stablecoin is not None and owner_private_key):
             st.error("Missing node connection, contract address, or owner private key.")
         elif not fiat_payment_reference.strip():
             st.error("Fiat payment reference is required.")
-        elif not payment_reference.strip():
-            st.error("Stablecoin payment reference is required.")
         elif interest_amount <= 0:
             st.error("Interest amount must be greater than zero.")
         else:
@@ -545,7 +551,7 @@ with tab_pay:
                     require_success(approve_receipt)
 
                 tx = contract.functions.payInterest(
-                    pay_mortgage_id, amount_units, fiat_payment_reference.strip(), payment_reference.strip()
+                    pay_mortgage_id, amount_units, fiat_payment_reference.strip()
                 ).build_transaction(
                     {
                         "from": account.address,
@@ -561,8 +567,24 @@ with tab_pay:
                 settled_events = contract.events.PaymentSettled().process_receipt(receipt)
                 if settled_events:
                     args = settled_events[0]["args"]
+                    payment_index = args["paymentIndex"]
+
+                    update_tx = contract.functions.updatePaymentReference(
+                        pay_mortgage_id, payment_index, tx_hash.hex()
+                    ).build_transaction(
+                        {
+                            "from": account.address,
+                            "nonce": w3.eth.get_transaction_count(account.address),
+                        }
+                    )
+                    signed_update = w3.eth.account.sign_transaction(update_tx, private_key=owner_private_key)
+                    update_hash = w3.eth.send_raw_transaction(signed_update.raw_transaction)
+                    with st.spinner("Recording payment reference..."):
+                        update_receipt = w3.eth.wait_for_transaction_receipt(update_hash)
+                    require_success(update_receipt)
+
                     st.success(
-                        f"Interest payment #{args['paymentIndex']} of {interest_amount} settled to {args['recipient']}."
+                        f"Interest payment #{payment_index} of {interest_amount} settled to {args['recipient']}."
                     )
                 else:
                     st.success("Transaction confirmed, but no PaymentSettled event was found.")
@@ -596,14 +618,14 @@ with tab_repay:
             st.error(f"Could not load mortgage: {e}")
 
     repayment_reference = st.text_input(
-        "Repayment reference", help="SIC payment reference for the fiat principal repayment."
+        "Fiat payment reference for repayment", help="SIC payment reference for the fiat principal repayment."
     )
 
     if st.button("Confirm Repayment", type="primary"):
         if not (connected and contract is not None and owner_private_key):
             st.error("Missing node connection, contract address, or owner private key.")
         elif not repayment_reference.strip():
-            st.error("Repayment reference is required.")
+            st.error("Fiat payment reference for repayment is required.")
         else:
             try:
                 account = w3.eth.account.from_key(owner_private_key)
@@ -761,12 +783,13 @@ with tab_lookup:
                 st.markdown(f"**Loan agreement ID:** {m[9] or 'none'}")
                 st.markdown(f"**Land registry extract ID:** {m[10] or 'none'}")
                 st.markdown(f"**Loan disbursement confirmed:** {'✅ yes' if m[11] else '❌ no'}")
-                st.markdown(f"**Disbursement reference:** {m[12] or 'none'}")
+                st.markdown(f"**Fiat payment reference for disbursement:** {m[12] or 'none'}")
                 st.markdown(f"**Principal repayment confirmed:** {'✅ yes' if m[13] else '❌ no'}")
-                st.markdown(f"**Principal repayment reference:** {m[14] or 'none'}")
+                st.markdown(f"**Fiat payment reference for repayment:** {m[14] or 'none'}")
                 st.markdown(f"**Document hashes:** {[h.hex() for h in doc_hashes] or 'none'}")
 
                 payment_status_labels = ["Pending", "Paid", "Late", "Missed"]
+                payment_category_labels = ["Purchase Price", "Interest Payment", "Principal Redemption"]
                 lookup_decimals = 18
                 if m[5] != "0x0000000000000000000000000000000000000000":
                     try:
@@ -780,8 +803,9 @@ with tab_lookup:
                 for i, record in enumerate(payment_records):
                     amount_display = record[1] / (10**lookup_decimals)
                     st.markdown(
-                        f"- #{i}: {amount_display} at {format_status_timestamp(record[5])} — "
-                        f"{payment_status_labels[record[2]]}, payer `{record[3]}`, recipient `{record[4]}`, "
+                        f"- #{i} [{payment_category_labels[record[8]]}]: {amount_display} at "
+                        f"{format_status_timestamp(record[5])} — {payment_status_labels[record[2]]}, "
+                        f"payer `{record[3]}`, recipient `{record[4]}`, "
                         f"fiat ref \"{record[6]}\", stablecoin ref \"{record[7]}\""
                     )
             except Exception as e:

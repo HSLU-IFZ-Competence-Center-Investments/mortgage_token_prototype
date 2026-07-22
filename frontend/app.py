@@ -141,84 +141,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Could not load contract: {e}")
 
-    st.header("Mint Test Stablecoins")
-    st.caption(
-        "Only works against a MockStablecoin with an open mint() function. "
-        "Real stablecoins (e.g. testnet USDC) will reject this."
-    )
-    mint_stablecoin_address = st.text_input(
-        "Stablecoin address", value=saved_state.get("mint_stablecoin_address", ""), key="mint_stablecoin_address"
-    )
-    save_state(mint_stablecoin_address=mint_stablecoin_address)
-    mint_signer_key = clean_hex_input(
-        st.text_input(
-            "Signer private key",
-            type="password",
-            help="Any account can call mint() on the mock — this just pays the gas.",
-            key="mint_signer_key",
-        )
-    )
-    mint_recipient = st.text_input("Mint to address", key="mint_recipient")
-    mint_amount = st.number_input("Mint amount", min_value=0.0, value=10000.0, step=100.0, key="mint_amount")
-    if st.button("Mint", key="mint_button"):
-        if not (connected and mint_stablecoin_address.strip() and mint_signer_key and mint_recipient.strip()):
-            st.error("Missing node connection, stablecoin address, signer private key, or recipient address.")
-        else:
-            try:
-                mint_stablecoin = w3.eth.contract(
-                    address=Web3.to_checksum_address(clean_hex_input(mint_stablecoin_address)), abi=ERC20_ABI
-                )
-                try:
-                    mint_decimals = mint_stablecoin.functions.decimals().call()
-                except Exception:
-                    mint_decimals = 18
-                mint_account = w3.eth.account.from_key(mint_signer_key)
-                mint_units = int(round(mint_amount * (10**mint_decimals)))
-                mint_tx = mint_stablecoin.functions.mint(
-                    Web3.to_checksum_address(clean_hex_input(mint_recipient)), mint_units
-                ).build_transaction(
-                    {
-                        "from": mint_account.address,
-                        "nonce": w3.eth.get_transaction_count(mint_account.address),
-                    }
-                )
-                signed_mint = w3.eth.account.sign_transaction(mint_tx, private_key=mint_signer_key)
-                mint_hash = w3.eth.send_raw_transaction(signed_mint.raw_transaction)
-                with st.spinner("Minting..."):
-                    mint_receipt = w3.eth.wait_for_transaction_receipt(mint_hash)
-                require_success(mint_receipt)
-                st.success(f"Minted {mint_amount} to {mint_recipient}.")
-            except Exception as e:
-                st.error(f"Mint failed: {e}")
-
-    st.header("Check Balance")
-    st.caption("Reads the raw on-chain balance directly via the RPC — no MetaMask import or network needed.")
-    balance_stablecoin_address = st.text_input(
-        "Stablecoin address",
-        value=saved_state.get("mint_stablecoin_address", ""),
-        key="balance_stablecoin_address",
-    )
-    balance_account_address = st.text_input("Account address", key="balance_account_address")
-    if st.button("Check Balance", key="check_balance_button"):
-        if not (connected and balance_stablecoin_address.strip() and balance_account_address.strip()):
-            st.error("Missing node connection, stablecoin address, or account address.")
-        else:
-            try:
-                balance_stablecoin = w3.eth.contract(
-                    address=Web3.to_checksum_address(clean_hex_input(balance_stablecoin_address)), abi=ERC20_ABI
-                )
-                try:
-                    balance_decimals = balance_stablecoin.functions.decimals().call()
-                    balance_symbol = balance_stablecoin.functions.symbol().call()
-                except Exception:
-                    balance_decimals = 18
-                    balance_symbol = ""
-                raw_balance = balance_stablecoin.functions.balanceOf(
-                    Web3.to_checksum_address(clean_hex_input(balance_account_address))
-                ).call()
-                st.success(f"Balance: {raw_balance / (10**balance_decimals)} {balance_symbol}".strip())
-            except Exception as e:
-                st.error(f"Balance check failed: {e}")
 
 tab_create, tab_transfer, tab_pay, tab_repay, tab_redeem, tab_burn, tab_lookup = st.tabs(
     [
@@ -338,7 +260,7 @@ with tab_create:
                 ).build_transaction(
                     {
                         "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address),
+                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
@@ -363,9 +285,10 @@ with tab_create:
 with tab_transfer:
     st.subheader("Settle purchase and transfer token")
     st.caption(
-        "Pulls the investor's stablecoin purchase price (the investor must approve this contract "
-        "beforehand) and forwards it to the issuer/processor, then transfers the mortgage token from "
-        "the issuer/processor to the investor."
+        "Pulls the investor's stablecoin purchase price and forwards it to the issuer/processor, then "
+        "transfers the mortgage token from the issuer/processor to the investor. The investor must first "
+        "approve this contract to spend the purchase price **themselves, from their own wallet** — the "
+        "bank/issuer never has and never needs the investor's private key."
     )
 
     if not connected:
@@ -408,67 +331,61 @@ with tab_transfer:
     )
     investor_address_input = st.text_input(
         "Investor address",
-        help="The investor's address, recorded on-chain as the mortgage's investor. Must match the "
-        "address derived from the investor private key below.",
+        help="The investor's address, recorded on-chain as the mortgage's investor. They must approve "
+        "this contract to spend the purchase price from their own wallet before you can settle.",
         key="investor_address",
     )
-    investor_private_key = clean_hex_input(
-        st.text_input(
-            "Investor private key",
-            type="password",
-            help="Used to sign the stablecoin approval; the investor must approve this contract "
-            "to spend the purchase price before it can be pulled.",
-            key="investor_private_key",
-        )
-    )
+
+    investor_address = None
+    purchase_price_units = None
+    current_allowance = None
+    if investor_address_input.strip() and transfer_stablecoin is not None:
+        try:
+            investor_address = Web3.to_checksum_address(clean_hex_input(investor_address_input))
+            purchase_price_units = int(round(purchase_price * (10**transfer_stablecoin_decimals)))
+            current_allowance = transfer_stablecoin.functions.allowance(investor_address, contract.address).call()
+            allowance_display = current_allowance / (10**transfer_stablecoin_decimals)
+            st.markdown(f"**Investor's current allowance to this contract:** {allowance_display}")
+
+            if current_allowance < purchase_price_units:
+                approve_calldata = transfer_stablecoin.encode_abi(
+                    "approve", args=[contract.address, purchase_price_units]
+                )
+                st.warning(
+                    "Investor has not approved enough yet. Ask the investor to approve **from their own "
+                    "wallet** (e.g. MetaMask, or the stablecoin contract's \"Write Contract\" tab on "
+                    "Etherscan) — the bank/issuer cannot and should not do this on their behalf:"
+                )
+                st.markdown(
+                    f"- **Contract to call:** `{transfer_stablecoin.address}`\n"
+                    f"- **Function:** `approve(spender, amount)`\n"
+                    f"- **spender:** `{contract.address}`\n"
+                    f"- **amount:** `{purchase_price_units}` (raw units)\n"
+                    f"- Raw calldata (paste into MetaMask's \"Hex data\" / a raw send): `{approve_calldata}`"
+                )
+        except Exception as e:
+            st.error(f"Could not check investor allowance: {e}")
 
     if st.button("Settle Purchase and Transfer", type="primary"):
-        if not (
-            connected
-            and contract is not None
-            and transfer_stablecoin is not None
-            and owner_private_key
-            and investor_address_input.strip()
-            and investor_private_key
-        ):
-            st.error("Missing node connection, contract address, owner private key, investor address, or investor private key.")
+        if not (connected and contract is not None and owner_private_key and investor_address):
+            st.error("Missing node connection, contract address, owner private key, or investor address.")
         elif purchase_price <= 0:
             st.error("Purchase price must be greater than zero.")
+        elif current_allowance is None or current_allowance < purchase_price_units:
+            st.error(
+                "Investor hasn't approved enough of the stablecoin yet. They need to approve from their "
+                "own wallet first (see instructions above)."
+            )
         else:
             try:
                 owner_account = w3.eth.account.from_key(owner_private_key)
-                investor_account = w3.eth.account.from_key(investor_private_key)
-                investor_address = Web3.to_checksum_address(clean_hex_input(investor_address_input))
-                if investor_address != investor_account.address:
-                    st.error(
-                        f"Investor address ({investor_address}) does not match the address derived "
-                        f"from the investor private key ({investor_account.address})."
-                    )
-                    st.stop()
-                purchase_price_units = int(round(purchase_price * (10**transfer_stablecoin_decimals)))
-
-                allowance = transfer_stablecoin.functions.allowance(investor_account.address, contract.address).call()
-                if allowance < purchase_price_units:
-                    approve_tx = transfer_stablecoin.functions.approve(
-                        contract.address, purchase_price_units
-                    ).build_transaction(
-                        {
-                            "from": investor_account.address,
-                            "nonce": w3.eth.get_transaction_count(investor_account.address),
-                        }
-                    )
-                    signed_approve = w3.eth.account.sign_transaction(approve_tx, private_key=investor_private_key)
-                    approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
-                    with st.spinner("Approving stablecoin spend..."):
-                        approve_receipt = w3.eth.wait_for_transaction_receipt(approve_hash)
-                    require_success(approve_receipt)
 
                 tx = contract.functions.transferTokenToInvestor(
-                    transfer_mortgage_id, investor_account.address, purchase_price_units
+                    transfer_mortgage_id, investor_address, purchase_price_units
                 ).build_transaction(
                     {
                         "from": owner_account.address,
-                        "nonce": w3.eth.get_transaction_count(owner_account.address),
+                        "nonce": w3.eth.get_transaction_count(owner_account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
@@ -549,7 +466,7 @@ with tab_pay:
                     approve_tx = stablecoin.functions.approve(contract.address, amount_units).build_transaction(
                         {
                             "from": account.address,
-                            "nonce": w3.eth.get_transaction_count(account.address),
+                            "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                         }
                     )
                     signed_approve = w3.eth.account.sign_transaction(approve_tx, private_key=owner_private_key)
@@ -563,7 +480,7 @@ with tab_pay:
                 ).build_transaction(
                     {
                         "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address),
+                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
@@ -582,7 +499,7 @@ with tab_pay:
                     ).build_transaction(
                         {
                             "from": account.address,
-                            "nonce": w3.eth.get_transaction_count(account.address),
+                            "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                         }
                     )
                     signed_update = w3.eth.account.sign_transaction(update_tx, private_key=owner_private_key)
@@ -642,7 +559,7 @@ with tab_repay:
                 ).build_transaction(
                     {
                         "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address),
+                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
@@ -728,7 +645,7 @@ with tab_redeem:
                     ).build_transaction(
                         {
                             "from": account.address,
-                            "nonce": w3.eth.get_transaction_count(account.address),
+                            "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                         }
                     )
                     signed_approve = w3.eth.account.sign_transaction(approve_tx, private_key=owner_private_key)
@@ -742,7 +659,7 @@ with tab_redeem:
                 ).build_transaction(
                     {
                         "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address),
+                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
@@ -802,7 +719,7 @@ with tab_burn:
                 tx = contract.functions.burnToken(burn_mortgage_id).build_transaction(
                     {
                         "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address),
+                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
                     }
                 )
                 signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)

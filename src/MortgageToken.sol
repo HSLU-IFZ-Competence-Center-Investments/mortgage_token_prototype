@@ -13,10 +13,7 @@ contract MortgageToken is ERC721, Ownable {
 
     enum LifecycleStatus {
         Created,
-        Disbursed,
         Active,
-        Matured,
-        Repaid,
         Redeemed,
         Closed
     }
@@ -248,39 +245,28 @@ contract MortgageToken is ERC721, Ownable {
         emit PaymentReferenceUpdated(mortgageId, paymentIndex, stablecoinPaymentReference_);
     }
 
-    /// @notice Records the reference to the fiat principal repayment conducted via
-    /// SIC at maturity, and moves the mortgage into Repaid status. No funds move
-    /// on-chain here — the SIC payment happens off-chain and this only confirms it.
-    function confirmPrincipalRepayment(uint256 mortgageId, string calldata repaymentReference_) external onlyOwner {
+    /// @notice Confirms the fiat principal repayment conducted via SIC at maturity, and in
+    /// the same call pulls the stablecoin principal redemption payment from the
+    /// issuer/processor (who must have approved this contract beforehand) forwarding it to
+    /// the current tokenholder (the investor), then transfers the mortgage token back from
+    /// the investor to the issuer/processor. Bundled into one call since the issuer/processor
+    /// is the one party confirming the fiat leg and funding the stablecoin leg. Moves the
+    /// mortgage directly from Active into Redeemed status. Use burnToken afterwards to close
+    /// out the mortgage.
+    function redeemToken(
+        uint256 mortgageId,
+        string calldata repaymentReference_,
+        uint256 principalPaymentAmount_
+    ) external onlyOwner {
         Mortgage storage mortgage = _mortgages[mortgageId];
         require(mortgage.mortgageId != 0, "mortgage does not exist");
         require(mortgage.status == LifecycleStatus.Active, "mortgage not active");
         require(block.timestamp >= mortgage.terms.maturityDate, "maturity date not reached");
-        require(!mortgage.principalRepaymentConfirmed, "principal repayment already confirmed");
         require(bytes(repaymentReference_).length != 0, "fiat payment reference for repayment required");
+        require(principalPaymentAmount_ > 0, "principal payment amount must be greater than zero");
 
         mortgage.principalRepaymentConfirmed = true;
         mortgage.principalRepaymentReference = repaymentReference_;
-
-        LifecycleStatus previousStatus = mortgage.status;
-        mortgage.status = LifecycleStatus.Repaid;
-        mortgage.statusChangedAt = block.timestamp;
-
-        emit PrincipalRepaymentConfirmed(mortgageId, repaymentReference_);
-        emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Repaid);
-    }
-
-    /// @notice Pulls the stablecoin principal redemption payment from the issuer/processor
-    /// (who must have approved this contract beforehand) forwarding it to the current
-    /// tokenholder (the investor), then transfers the mortgage token back from the
-    /// investor to the issuer/processor and moves the mortgage into Redeemed status.
-    /// Requires confirmPrincipalRepayment to have been called first. Use burnToken
-    /// afterwards to close out the mortgage.
-    function redeemToken(uint256 mortgageId, uint256 principalPaymentAmount_) external onlyOwner {
-        Mortgage storage mortgage = _mortgages[mortgageId];
-        require(mortgage.mortgageId != 0, "mortgage does not exist");
-        require(mortgage.status == LifecycleStatus.Repaid, "principal repayment not confirmed");
-        require(principalPaymentAmount_ > 0, "principal payment amount must be greater than zero");
 
         address recipient = ownerOf(mortgageId);
 
@@ -307,6 +293,7 @@ contract MortgageToken is ERC721, Ownable {
         mortgage.status = LifecycleStatus.Redeemed;
         mortgage.statusChangedAt = block.timestamp;
 
+        emit PrincipalRepaymentConfirmed(mortgageId, repaymentReference_);
         emit PaymentSettled(mortgageId, paymentIndex, mortgage.issuer, recipient, "", "", PaymentCategory.PrincipalRedemption);
         emit TokenRedeemed(mortgageId, recipient, principalPaymentAmount_);
         emit LifecycleStatusChanged(mortgageId, previousStatus, LifecycleStatus.Redeemed);

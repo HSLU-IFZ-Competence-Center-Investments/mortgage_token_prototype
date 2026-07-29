@@ -113,7 +113,7 @@ def save_state(**kwargs) -> None:
 saved_state = load_state()
 
 st.title("\U0001F3E0 Mortgage Token Demo")
-st.caption("Prototype frontend for the MortgageToken ERC-721 contract, running against a local Anvil node.")
+st.caption("Prototype frontend for the MortgageToken ERC-721 contract.")
 
 with st.sidebar:
     st.header("Connection")
@@ -142,13 +142,12 @@ with st.sidebar:
             st.error(f"Could not load contract: {e}")
 
 
-tab_create, tab_transfer, tab_pay, tab_repay, tab_redeem, tab_burn, tab_lookup = st.tabs(
+tab_create, tab_transfer, tab_pay, tab_redeem, tab_burn, tab_lookup = st.tabs(
     [
         "Create Mortgage",
         "Transfer to Investor",
         "Pay Interest",
-        "Confirm Repayment",
-        "Redeem",
+        "Confirm Repayment & Redeem",
         "Burn",
         "Look Up Mortgage",
     ]
@@ -158,7 +157,7 @@ with tab_create:
     st.subheader("Create a new mortgage token")
 
     if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+        st.warning("Connect to an RPC node via the sidebar first.")
     elif contract is None:
         st.warning("Enter a deployed contract address in the sidebar.")
 
@@ -292,7 +291,7 @@ with tab_transfer:
     )
 
     if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+        st.warning("Connect to an RPC node via the sidebar first.")
     elif contract is None:
         st.warning("Enter a deployed contract address in the sidebar.")
 
@@ -305,7 +304,7 @@ with tab_transfer:
         try:
             m = contract.functions.getMortgage(transfer_mortgage_id).call()
             holder = contract.functions.currentTokenholder(transfer_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            lifecycle_labels = ["Created", "Active", "Redeemed", "Closed"]
             st.markdown(f"**Current tokenholder:** `{holder}`")
             st.markdown(f"**Issuer:** `{m[1]}`")
             st.markdown(f"**Investor:** `{m[3]}`")
@@ -416,7 +415,7 @@ with tab_pay:
     )
 
     if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+        st.warning("Connect to an RPC node via the sidebar first.")
     elif contract is None:
         st.warning("Enter a deployed contract address in the sidebar.")
 
@@ -429,7 +428,7 @@ with tab_pay:
         try:
             m = contract.functions.getMortgage(pay_mortgage_id).call()
             holder = contract.functions.currentTokenholder(pay_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            lifecycle_labels = ["Created", "Active", "Redeemed", "Closed"]
             st.markdown(f"**Borrower:** `{m[2]}`")
             st.markdown(f"**Current tokenholder (recipient):** `{holder}`")
             st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
@@ -517,77 +516,18 @@ with tab_pay:
             except Exception as e:
                 st.error(f"Transaction failed: {e}")
 
-with tab_repay:
-    st.subheader("Confirm principal repayment")
-    st.caption(
-        "Records the reference to the fiat principal repayment conducted via SIC at maturity. "
-        "No funds move on-chain here — this only confirms an off-chain payment and moves the "
-        "mortgage into Repaid status."
-    )
-
-    if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
-    elif contract is None:
-        st.warning("Enter a deployed contract address in the sidebar.")
-
-    repay_mortgage_id = st.number_input("Mortgage ID", min_value=1, step=1, value=1, key="repay_mortgage_id")
-
-    if contract is not None:
-        try:
-            m = contract.functions.getMortgage(repay_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
-            st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
-            st.markdown(f"**Maturity date:** {datetime.fromtimestamp(m[4][2]).date()}")
-            st.markdown(f"**Principal repayment confirmed:** {'✅ yes' if m[13] else '❌ no'}")
-        except Exception as e:
-            st.error(f"Could not load mortgage: {e}")
-
-    repayment_reference = st.text_input(
-        "Fiat payment reference for repayment", help="SIC payment reference for the fiat principal repayment."
-    )
-
-    if st.button("Confirm Repayment", type="primary"):
-        if not (connected and contract is not None and owner_private_key):
-            st.error("Missing node connection, contract address, or owner private key.")
-        elif not repayment_reference.strip():
-            st.error("Fiat payment reference for repayment is required.")
-        else:
-            try:
-                account = w3.eth.account.from_key(owner_private_key)
-                tx = contract.functions.confirmPrincipalRepayment(
-                    repay_mortgage_id, repayment_reference.strip()
-                ).build_transaction(
-                    {
-                        "from": account.address,
-                        "nonce": w3.eth.get_transaction_count(account.address, "pending"),
-                    }
-                )
-                signed = w3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                with st.spinner("Waiting for transaction receipt..."):
-                    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-                require_success(receipt)
-
-                confirmed_events = contract.events.PrincipalRepaymentConfirmed().process_receipt(receipt)
-                if confirmed_events:
-                    st.success(f"Principal repayment confirmed for mortgage #{repay_mortgage_id}.")
-                else:
-                    st.success("Transaction confirmed, but no PrincipalRepaymentConfirmed event was found.")
-                st.markdown(f"**Tx hash:** `{tx_hash.hex()}`")
-            except Exception as e:
-                st.error(f"Transaction failed: {e}")
-
 with tab_redeem:
-    st.subheader("Redeem token")
+    st.subheader("Confirm principal repayment & redeem token")
     st.caption(
-        "Pulls the stablecoin principal redemption payment from the issuer/processor's wallet, forwards "
-        "it to the investor (the current tokenholder), then transfers the mortgage token back from the "
-        "investor to the issuer. Requires principal repayment to have already been confirmed on the "
-        "\"Confirm Repayment\" tab. Use the \"Burn\" tab afterwards to close out the mortgage."
+        "Confirms the fiat principal repayment conducted via SIC at maturity and, in the same "
+        "transaction, pulls the stablecoin principal redemption payment from the issuer/processor's "
+        "wallet, forwards it to the investor (the current tokenholder), then transfers the mortgage "
+        "token back from the investor to the issuer. Use the \"Burn\" tab afterwards to close out "
+        "the mortgage."
     )
 
     if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+        st.warning("Connect to an RPC node via the sidebar first.")
     elif contract is None:
         st.warning("Enter a deployed contract address in the sidebar.")
 
@@ -600,11 +540,11 @@ with tab_redeem:
         try:
             m = contract.functions.getMortgage(redeem_mortgage_id).call()
             holder = contract.functions.currentTokenholder(redeem_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            lifecycle_labels = ["Created", "Active", "Redeemed", "Closed"]
             st.markdown(f"**Current tokenholder (investor):** `{holder}`")
             st.markdown(f"**Issuer:** `{m[1]}`")
             st.markdown(f"**Status:** {lifecycle_labels[m[6]]} ({format_status_timestamp(m[7])})")
-            st.markdown(f"**Principal repayment confirmed:** {'✅ yes' if m[13] else '❌ no'}")
+            st.markdown(f"**Maturity date:** {datetime.fromtimestamp(m[4][2]).date()}")
 
             redeem_stablecoin = w3.eth.contract(address=Web3.to_checksum_address(m[5]), abi=ERC20_ABI)
             try:
@@ -620,6 +560,10 @@ with tab_redeem:
         except Exception as e:
             st.error(f"Could not load mortgage: {e}")
 
+    repayment_reference = st.text_input(
+        "Fiat payment reference for repayment", help="SIC payment reference for the fiat principal repayment."
+    )
+
     principal_payment_amount = st.number_input(
         "Principal payment amount",
         min_value=0.0,
@@ -628,9 +572,11 @@ with tab_redeem:
         key="principal_payment_amount",
     )
 
-    if st.button("Redeem Token", type="primary"):
+    if st.button("Confirm Repayment & Redeem Token", type="primary"):
         if not (connected and contract is not None and redeem_stablecoin is not None and owner_private_key):
             st.error("Missing node connection, contract address, or owner private key.")
+        elif not repayment_reference.strip():
+            st.error("Fiat payment reference for repayment is required.")
         elif principal_payment_amount <= 0:
             st.error("Principal payment amount must be greater than zero.")
         else:
@@ -655,7 +601,7 @@ with tab_redeem:
                     require_success(approve_receipt)
 
                 tx = contract.functions.redeemToken(
-                    redeem_mortgage_id, principal_units
+                    redeem_mortgage_id, repayment_reference.strip(), principal_units
                 ).build_transaction(
                     {
                         "from": account.address,
@@ -672,9 +618,9 @@ with tab_redeem:
                 if redeemed_events:
                     args = redeemed_events[0]["args"]
                     st.success(
-                        f"Mortgage token #{redeem_mortgage_id} redeemed ({principal_payment_amount} paid to "
-                        f"{args['investor']}) and transferred back to the issuer. Use the \"Burn\" tab to "
-                        "close out the mortgage."
+                        f"Principal repayment confirmed and mortgage token #{redeem_mortgage_id} redeemed "
+                        f"({principal_payment_amount} paid to {args['investor']}) and transferred back to "
+                        "the issuer. Use the \"Burn\" tab to close out the mortgage."
                     )
                 else:
                     st.success("Transaction confirmed, but no TokenRedeemed event was found.")
@@ -690,7 +636,7 @@ with tab_burn:
     )
 
     if not connected:
-        st.warning("Connect to a running node (e.g. `anvil`) via the sidebar first.")
+        st.warning("Connect to an RPC node via the sidebar first.")
     elif contract is None:
         st.warning("Enter a deployed contract address in the sidebar.")
 
@@ -699,7 +645,7 @@ with tab_burn:
     if contract is not None:
         try:
             m = contract.functions.getMortgage(burn_mortgage_id).call()
-            lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+            lifecycle_labels = ["Created", "Active", "Redeemed", "Closed"]
             try:
                 holder = contract.functions.currentTokenholder(burn_mortgage_id).call()
                 st.markdown(f"**Current tokenholder (issuer):** `{holder}`")
@@ -751,7 +697,7 @@ with tab_lookup:
                 doc_hashes = contract.functions.getDocumentHashes(mortgage_id).call()
                 payment_records = contract.functions.getPaymentRecords(mortgage_id).call()
 
-                lifecycle_labels = ["Created", "Disbursed", "Active", "Matured", "Repaid", "Redeemed", "Closed"]
+                lifecycle_labels = ["Created", "Active", "Redeemed", "Closed"]
 
                 try:
                     holder = contract.functions.currentTokenholder(mortgage_id).call()
